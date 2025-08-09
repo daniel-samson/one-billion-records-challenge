@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::str::FromStr;
+use memmap2::MmapOptions;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WeatherRecord {
@@ -48,6 +49,124 @@ impl WeatherCsvReader<File> {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, WeatherError> {
         let file = File::open(path)?;
         Ok(Self::from_reader(file))
+    }
+}
+
+pub struct MmapWeatherCsvReader {
+    mmap: memmap2::Mmap,
+    position: usize,
+    line_number: usize,
+}
+
+impl MmapWeatherCsvReader {
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, WeatherError> {
+        let file = File::open(path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        Ok(Self {
+            mmap,
+            position: 0,
+            line_number: 0,
+        })
+    }
+
+    pub fn records(&mut self) -> MmapWeatherRecordIterator<'_> {
+        MmapWeatherRecordIterator::new(self)
+    }
+
+    pub fn read_all(mut self) -> Result<Vec<WeatherRecord>, WeatherError> {
+        let mut records = Vec::new();
+        for record in self.records() {
+            records.push(record?);
+        }
+        Ok(records)
+    }
+}
+
+pub struct MmapWeatherRecordIterator<'a> {
+    reader: &'a mut MmapWeatherCsvReader,
+}
+
+impl<'a> MmapWeatherRecordIterator<'a> {
+    fn new(reader: &'a mut MmapWeatherCsvReader) -> Self {
+        Self { reader }
+    }
+
+    fn parse_line(&self, line: &str) -> Result<WeatherRecord, WeatherError> {
+        let line = line.trim();
+        
+        if line.is_empty() {
+            return Err(WeatherError::InvalidFormat(
+                format!("Line {} is empty", self.reader.line_number)
+            ));
+        }
+
+        let parts: Vec<&str> = line.split(';').collect();
+        if parts.len() != 2 {
+            return Err(WeatherError::InvalidFormat(
+                format!("Line {} does not have exactly 2 columns separated by ';'. Found {} columns", 
+                       self.reader.line_number, parts.len())
+            ));
+        }
+
+        let station = parts[0].trim().to_string();
+        if station.is_empty() {
+            return Err(WeatherError::InvalidFormat(
+                format!("Line {}: Weather station name cannot be empty", self.reader.line_number)
+            ));
+        }
+
+        let temperature_str = parts[1].trim();
+        let temperature = f64::from_str(temperature_str)
+            .map_err(|_| WeatherError::Parse(
+                format!("Line {}: Cannot parse temperature '{}' as a number", 
+                       self.reader.line_number, temperature_str)
+            ))?;
+
+        Ok(WeatherRecord::new(station, temperature))
+    }
+}
+
+impl<'a> Iterator for MmapWeatherRecordIterator<'a> {
+    type Item = Result<WeatherRecord, WeatherError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.reader.position >= self.reader.mmap.len() {
+            return None;
+        }
+
+        // Find the next line
+        let start = self.reader.position;
+        let mut end = start;
+        
+        // Find end of line
+        while end < self.reader.mmap.len() && self.reader.mmap[end] != b'\n' {
+            end += 1;
+        }
+
+        if start == end && end >= self.reader.mmap.len() {
+            return None; // EOF with no data
+        }
+
+        let line_bytes = &self.reader.mmap[start..end];
+        
+        // Skip to next line (past the \n)
+        self.reader.position = if end < self.reader.mmap.len() { end + 1 } else { end };
+        self.reader.line_number += 1;
+
+        // Convert to string
+        let line = match std::str::from_utf8(line_bytes) {
+            Ok(s) => s,
+            Err(_) => return Some(Err(WeatherError::InvalidFormat(
+                format!("Line {}: Invalid UTF-8 encoding", self.reader.line_number)
+            ))),
+        };
+
+        // Skip empty lines
+        if line.trim().is_empty() {
+            return self.next();
+        }
+
+        Some(self.parse_line(line))
     }
 }
 
